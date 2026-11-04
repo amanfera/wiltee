@@ -18,7 +18,7 @@ not started.
 |---|---|---|
 | RV32IMA hart, Sv32, UART, PLIC, SBI, interactive Linux shell | verified (merged in #1) | 59/59 riscv-tests; `make test-linux` |
 | GPU toolchain (CUDA 13.3 NVRTC on an NVIDIA L4) | verified | `pow2!` returned the correct result in 3 ms with `+RTS --gpu 1GB` |
-| Fleet on the GPU | **blocked**: never finished on the device | see "GPU findings" |
+| Fleet on the GPU | **verified**: up to 4096 machines per bang, 1.28 G guest instr/s on an L4 | see "GPU findings" |
 | RV64 userspace (compiler-rt builtins, musl 1.2.5, busybox 1.36.1) | verified | busybox: ELF64, soft-float `e_flags` = 0, all 296,746 instructions are 4 bytes, no FP |
 | RV64 kernel (Linux 6.12.115, rv64ima, SMP, virtio-mmio blk/net) | partial: script and config written; kernel step never ran | `scripts/build-linux64.sh`, `platform/linux64.config` |
 | RV64 hart in Bend | not started | — |
@@ -28,39 +28,58 @@ not started.
 
 ## GPU findings (L4, sm_89, 23 GB, driver CUDA 13.3)
 
-- **Setup:** Bend compiles the device program at runtime with NVRTC. It
-  needs `cuda-nvrtc-dev`, `cuda-driver-dev` and `cuda-cudart-dev` (13.3)
-  under `/usr/local/cuda`, plus clang 19.
-- **Default memory reservation hangs.** Without `--gpu`, the runtime
-  reserves the whole device as managed memory: the main thread stalled in a
-  23.7 GB `mmap` inside `cuMemAllocManaged`. With `+RTS --gpu 1GB`, `pow2!`
-  ran correctly. Always pass an explicit `--gpu` size.
-- **The fleet never finished on the device.**
-  - With `--gpu 4GB`, fleets of 4 and 16 machines (128 MiB RAM each)
-    printed nothing within 240 s.
-  - With RAM cut to 64 KiB per machine, a fleet of 2 still timed out after
-    200 s. Then the tunnel closed.
-  - The same 16-machine fleet on the CPU pool (`--gpu off`, 17 threads):
-    256M guest instructions in 766 ms.
-- **Hypotheses, none tested:**
-  1. One lane per machine running a long serial interpreter loop is very
-     slow on the device (the Bend guide puts a lane at about 1/75 of a
-     P-core on serial work). The 2M-instruction epoch budget may just be
-     minutes per epoch.
-  2. Managed-memory page migration on first touch of each machine's RAM.
-  3. The device stack or continuation limits for the deep, non-forking
-     `epoch -> slice -> run -> step` chain.
+Setup: Bend compiles the device program with NVRTC at build time and loads
+the cubin from `<binary>.gpu` at run time. The box needs:
+- `cuda-nvrtc-dev`, `cuda-driver-dev`, `cuda-cudart-dev` (13.3), so that
+  `/usr/local/cuda/include/nvrtc.h` exists
+- clang 19
 
-  The first measurement to take: a 1,000-instruction budget with 1 and 64
-  machines, to get per-lane MIPS.
+**The `--gpu` reservation decides whether anything runs.**
+- The runtime takes its whole span as managed memory. The driver populates
+  that span page by page on the host CPU.
+- Without `--gpu` it asks for the whole device (23.7 GB), and at 1.5 GB or
+  more it stalls inside `cuMemAllocManaged -> mmap`. That stall, not the
+  emulator, is why the first session's fleets never finished.
+- 512 MB to 1 GB starts in about 150 ms. 256 MB is too small for the
+  runtime's rings and stacks.
+- Use `+RTS --gpu 1GB` (`tests/gpu/sweep.sh` does).
+
+**Measured** with `tests/gpu/bench.bend`: a fleet of 2^d bare-metal machines,
+64 KiB RAM each, running an LCG loop. Steady-state timing is the third bang.
+The CPU baseline is that box's single core (the container had `nproc` = 1).
+
+| machines | budget/epoch | GPU bang | CPU (1 core) | GPU guest instr/s |
+|---|---|---|---|---|
+| 1 | 100k | 67 ms | 2 ms | 1.5 M (one lane) |
+| 64 | 100k | 106 ms | 16 ms | 60 M |
+| 1024 | 10k | 15 ms | 30 ms | 683 M |
+| 1024 | 100k | 140 ms | 183 ms | 731 M |
+| 4096 | 10k | 35 ms | 77 ms | 1.17 G |
+| 4096 | 100k | 320 ms | 522 ms | **1.28 G** |
+
+Reading the numbers:
+- **Throughput scales with machine count.** A single lane is about 30x
+  slower than a host core.
+- **The GPU passes one core at about 1000 machines** and is 1.6–2.2x at
+  4096. That is an L4 against one core; this is not yet a win over a
+  multi-core host.
+- **Per-lane speed drops under load:** 1.5 M instr/s alone, about 0.3 M at
+  4096 lanes. That points at memory-bound array access. A Bend `Array` is a
+  balanced tree, so every guest load, store or fetch walks log2(size)
+  levels: 14 for 64 KiB of RAM, 25 for 128 MiB.
+- **16384 machines do not fit in 1 GB.** Each machine carries its own
+  device-word array. Its console TX buffer was cut from 64 KiB to 8 KiB to
+  get 4096 to fit.
 
 ## Next steps, in order
 
-1. **GPU bring-up** (needs a GPU box): per-lane MIPS as above, then size
-   the epoch budget and machine RAM to fit; keep `--gpu` explicit. If lanes
-   are too slow for one machine per lane, change the decomposition: split
-   one hart's step across a warp (decode / execute / memory as separate
-   lanes over a batch of harts), or run many short epochs per bang.
+1. **GPU throughput.** Bring-up is done.
+   - Cut the per-access tree walk: a flat RAM representation (check whether
+     the runtime's native `array_get` is O(1) on the device), or a per-hart
+     software cache of recently used RAM pages.
+   - Shrink the per-machine fixed footprint so 16384 machines fit in a
+     1 GB span.
+   - Then re-measure against a multi-core host.
 2. **Minimise the CPU's role.**
    - Today: one bang per epoch, and the host does the console and pacing.
    - Target: K epochs per bang, with console bytes kept in a device-side
