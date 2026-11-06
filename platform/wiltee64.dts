@@ -1,0 +1,71 @@
+/dts-v1/;
+
+/* The wiltee RV64 platform: one RV64IMAC hart (Sv39), 128 MiB of RAM at 0,
+ * a 16550 UART and a PLIC. The timer, IPIs and remote fences are SBI calls
+ * answered by the emulator; `time` advances one tick per instruction. */
+/ {
+	#address-cells = <2>;
+	#size-cells = <2>;
+	model = "wiltee";
+	compatible = "wiltee,rv64";
+
+	aliases {
+		serial0 = "/soc@f0000000/serial@4000000";
+	};
+
+	chosen {
+		bootargs = "earlycon console=ttyS0";
+		stdout-path = "serial0";
+	};
+
+	cpus {
+		#address-cells = <1>;
+		#size-cells = <0>;
+		timebase-frequency = <10000000>;
+
+		cpu0: cpu@0 {
+			device_type = "cpu";
+			compatible = "riscv";
+			reg = <0>;
+			riscv,isa = "rv64imac";
+			mmu-type = "riscv,sv39";
+
+			cpu0_intc: interrupt-controller {
+				#interrupt-cells = <1>;
+				interrupt-controller;
+				compatible = "riscv,cpu-intc";
+			};
+		};
+	};
+
+	memory@0 {
+		device_type = "memory";
+		reg = <0x0 0x00000000 0x0 0x08000000>;
+	};
+
+	soc: soc@f0000000 {
+		#address-cells = <1>;
+		#size-cells = <1>;
+		compatible = "simple-bus";
+		ranges = <0x0 0x0 0xf0000000 0x10000000>;
+		interrupt-parent = <&plic0>;
+
+		plic0: interrupt-controller@0 {
+			#interrupt-cells = <1>;
+			#address-cells = <0>;
+			compatible = "sifive,plic-1.0.0";
+			reg = <0x0000000 0x4000000>;
+			interrupt-controller;
+			interrupts-extended = <&cpu0_intc 9>;
+			riscv,ndev = <31>;
+		};
+
+		serial@4000000 {
+			compatible = "ns16550";
+			reg = <0x4000000 0x100000>;
+			interrupts = <1>;
+			no-loopback-test;
+			clock-frequency = <5000000>;
+		};
+	};
+};
