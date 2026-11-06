@@ -79,9 +79,6 @@ class Console:
         if self.verbose:
             sys.stdout.write(text.replace("\r", ""))
             sys.stdout.flush()
-        # busybox's line editor asks the terminal for its size; answer like a terminal would
-        for _ in range(text.count("\x1b[6n")):
-            os.write(self.fd, b"\x1b[24;80R")
         self.buf += text
 
     def expect(self, pattern, what, timeout):
