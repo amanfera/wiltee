@@ -222,11 +222,12 @@ def P.IE() -> U32:
   22
 def P.TH() -> U32:
   23
-# RX ring: 256 bytes at 256. TX buffer: 65536 bytes at 65536.
+# RX ring: 256 bytes at 256. TX buffer: 8192 bytes at 8192 (drained every
+# epoch; small, since every machine of a fleet carries one).
 def U.RX() -> U32:
   256
 def U.TX() -> U32:
-  65536
+  8192
 
 def md.of(+priv: U32, +st: U32, +satp: U32) -> U32:
   U32.or(U32.or(priv, U32.and(U32.shrn(st, 17n), 6)), U32.and(U32.shrn(satp, 28n), 8))
@@ -442,7 +443,7 @@ def dev.tx.at(+ok: Bool, d: Array<U32>, +k: U32, +b: U32) -> Array<U32>:
 
 def tx.push.k(+b: U32, p: Array<U32> & U32) -> Array<U32>:
   (d, +k) = p
-  dev.tx.at(U32.is_lt(k, 65536), d, k, b)
+  dev.tx.at(U32.is_lt(k, 8192), d, k, b)
 
 # Appends a byte to the TX buffer the host drains after each epoch.
 def tx.push(d: Array<U32>, +b: U32) -> Array<U32>:
@@ -1460,7 +1461,7 @@ def Hart.new(m: Array<U32>, +hid: U32, +dtb: U32, +pc: U32) -> Hart:
   x = [0 : U32*32n]
   x[10] <- hid
   x[11] <- dtb
-  d = [0 : U32*131072n]
+  d = [0 : U32*16384n]
   d[D.CL()] <- 4294967295
   d[D.CH()] <- 4294967295
   d[D.HART()] <- hid
