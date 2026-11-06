@@ -1,8 +1,10 @@
 import Base
 
 # RVC (RV64GC "C" extension) expander: 16-bit halfword -> 32-bit instruction.
-# Reserved and RV32-only encodings return 0; hints expand to harmless base
-# instructions (writes to x0), never 0.
+# Reserved encodings return 0; hints expand to harmless base instructions
+# (writes to x0), never 0. The RV32-only encodings are RV64 instructions here:
+# C.JAL is C.ADDIW, and C.FLW, C.FSW, C.FLWSP, C.FSWSP are C.LD, C.SD, C.LDSP,
+# C.SDSP. tests/rvc/check.sh compares every halfword with LLVM.
 
 # Field helpers
 # -------------
@@ -134,8 +136,9 @@ def C.stW(+h: U32) -> U32:
 # Quadrant 1
 # ----------
 
+# imm = 0 (C.NOP and its HINTs) writes x0
 def C.addi(+h: U32) -> U32:
-  C.encI(C.simm6(h), C.rd(h), C.rd(h), 19)
+  C.encI(C.simm6(h), C.rd(h), C.nz(C.imm6(h), C.rd(h)), 19)
 
 def C.addiw(+h: U32) -> U32:
   C.nz(C.rd(h), C.encI(C.simm6(h), C.rd(h), C.rd(h), 27))
@@ -167,12 +170,13 @@ def C.q1_3.e(+h: U32, +rd: U32) -> U32:
 def C.q1_3(+h: U32) -> U32:
   C.q1_3.e(h, C.rd(h))
 
-# shifts and andi on rd' (bits 9:7); srai sets bit 10 of the immediate
+# shifts and andi on rd' (bits 9:7); srai sets bit 10 of the immediate;
+# shamt = 0 (a HINT) writes x0
 def C.srli(+h: U32) -> U32:
-  C.encI(C.imm6(h), C.rpa(h), C.rpa(h), 20499)
+  C.encI(C.imm6(h), C.rpa(h), C.nz(C.imm6(h), C.rpa(h)), 20499)
 
 def C.srai(+h: U32) -> U32:
-  C.encI(U32.or(C.imm6(h), 1024), C.rpa(h), C.rpa(h), 20499)
+  C.encI(U32.or(C.imm6(h), 1024), C.rpa(h), C.nz(C.imm6(h), C.rpa(h)), 20499)
 
 def C.andi(+h: U32) -> U32:
   C.encI(C.simm6(h), C.rpa(h), C.rpa(h), 28691)
@@ -225,7 +229,7 @@ def C.br(+h: U32, +k: U32) -> U32:
 # ----------
 
 def C.slli(+h: U32) -> U32:
-  C.encI(C.imm6(h), C.rd(h), C.rd(h), 4115)
+  C.encI(C.imm6(h), C.rd(h), C.nz(C.imm6(h), C.rd(h)), 4115)
 
 def C.immLDSP(+h: U32) -> U32:
   U32.or(C.mv(h, 12n, 1, 5n), U32.or(C.mv(h, 5n, 3, 3n), C.mv(h, 2n, 7, 6n)))

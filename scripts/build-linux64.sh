@@ -1,22 +1,39 @@
 #!/usr/bin/env bash
-# Builds build/linux64/Image: a riscv64 Linux 6.12 kernel with an embedded busybox
-# initramfs, restricted to RV64IMA + Zicsr + Zifencei (no C, F/D or V).
+# Builds build/linux64-$PROFILE/Image: a riscv64 Linux 6.12 kernel with an embedded
+# musl/busybox initramfs, for one of three ISA profiles (PROFILE, default gc):
 #
-# Pipeline (finished steps are skipped via stamp files in $RV64_SW/stamps):
-#   compiler-rt builtins -> musl (static) -> busybox (static) -> initramfs -> kernel
-# Needs: clang-19, ld.lld-19, llvm-{ar,ranlib,objcopy,objdump}-19, host gcc, make,
-# bc, flex, bison, perl, curl, xz, bzip2.
+#   ima   rv64ima    / lp64    no C, no F/D   kernel RISCV_ISA_C=n FPU=n
+#   imac  rv64imac   / lp64    C, no F/D      kernel RISCV_ISA_C=y FPU=n
+#   gc    rv64imafdc / lp64d   C + F/D        kernel RISCV_ISA_C=y FPU=y (hard float everywhere)
+#
+# Usage: [PROFILE=ima|imac|gc] [JOBS=n] [RV64_SW=/tmp/rv64-sw] scripts/build-linux64.sh
+# Outputs (build/linux64-$PROFILE/): Image vmlinux System.map kernel.config initramfs.list busybox
+#
+# Pipeline (finished steps are skipped via stamp files in $RV64_SW/$PROFILE/stamps):
+#   compiler-rt builtins -> musl (static) -> busybox (static) -> initramfs list -> kernel
+#   -> instruction-mix check (llvm-objdump) of vmlinux, vdso and busybox
+# Source tarballs are shared in $RV64_SW/dl; everything else is per profile.
+# Needs: clang-19, ld.lld-19, llvm-{ar,ranlib,objcopy,objdump,strip}-19, host gcc, make,
+# bc, flex, bison, perl, curl, xz, bzip2, flock.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 REPO=$PWD
 
-W=${RV64_SW:-/tmp/rv64-sw}
-OUT=$REPO/build/linux64
+PROFILE=${PROFILE:-gc}
+case $PROFILE in
+  ima)  MARCH=rv64ima;    MABI=lp64 ;;
+  imac) MARCH=rv64imac;   MABI=lp64 ;;
+  gc)   MARCH=rv64imafdc; MABI=lp64d ;;
+  *) echo "PROFILE must be ima, imac or gc (got '$PROFILE')" >&2; exit 2 ;;
+esac
+
+RV64_SW=${RV64_SW:-/tmp/rv64-sw}
+DL=$RV64_SW/dl
+W=$RV64_SW/$PROFILE
+OUT=$REPO/build/linux64-$PROFILE
 JOBS=${JOBS:-$(nproc)}
 LLVM_VER=19
 TARGET=riscv64-unknown-linux-musl
-MARCH=rv64ima
-MABI=lp64
 
 # name|url|sha256
 LINUX_VER=6.12.115
@@ -41,38 +58,45 @@ SYSROOT=$W/sysroot
 BUILTINS=$W/crt/libclang_rt.builtins-riscv64.a
 CCW=$W/cc-rv64
 STAMPS=$W/stamps
-mkdir -p "$W" "$SRC" "$STAMPS" "$OUT" "$W/crt"
+mkdir -p "$DL" "$W" "$SRC" "$STAMPS" "$OUT" "$W/crt"
 
-log() { printf '\n==> %s\n' "$*"; }
+log() { printf '\n==> [%s] %s\n' "$PROFILE" "$*"; }
 done_() { [ -f "$STAMPS/$1" ]; }
 mark() { touch "$STAMPS/$1"; }
 
-fetch() { # tar url sha
-  local f=$W/$1
-  if [ -f "$f" ] && [ "$(sha256sum "$f" | cut -d' ' -f1)" != "$3" ]; then rm -f "$f"; fi
-  if [ ! -f "$f" ]; then
-    log "download $1"
-    curl -fL --retry 3 -o "$f.part" "$2"
-    mv "$f.part" "$f"
-  fi
-  echo "$3  $f" | sha256sum -c - >/dev/null || { echo "sha256 mismatch: $f" >&2; exit 1; }
+fetch() { # tarball url sha256 (cache shared between profiles, so serialise downloads)
+  local f=$DL/$1
+  ( flock 9
+    if [ -f "$f" ] && [ "$(sha256sum "$f" | cut -d' ' -f1)" != "$3" ]; then rm -f "$f"; fi
+    if [ ! -f "$f" ]; then
+      log "download $1"
+      curl -fL --retry 3 -o "$f.part" "$2"
+      mv "$f.part" "$f"
+    fi
+    echo "$3  $f" | sha256sum -c - >/dev/null || { echo "sha256 mismatch: $f" >&2; exit 1; }
+  ) 9>"$DL/.lock"
 }
 
-extract() { # tar dir
+extract() { # tarball dir
   [ -f "$SRC/$2/.extracted" ] && return 0
   rm -rf "${SRC:?}/$2"
-  tar -C "$SRC" -xf "$W/$1"
+  tar -C "$SRC" -xf "$DL/$1"
   touch "$SRC/$2/.extracted"
 }
 
-CLANG="clang-$LLVM_VER --target=$TARGET -march=$MARCH -mabi=$MABI"
+# Static non-PIE code throughout (clang defaults to PIE for *-musl triples).
+RVFLAGS="--target=$TARGET -march=$MARCH -mabi=$MABI -fno-pic -fno-pie"
+CLANG="clang-$LLVM_VER $RVFLAGS"
+LLD=$(command -v ld.lld-$LLVM_VER)
 
+log "profile $PROFILE: -march=$MARCH -mabi=$MABI, work dir $W, jobs $JOBS"
 fetch "$LINUX_TAR" "$LINUX_URL" "$LINUX_SHA"
 fetch "$MUSL_TAR" "$MUSL_URL" "$MUSL_SHA"
 fetch "$BB_TAR" "$BB_URL" "$BB_SHA"
 fetch "$CRT_TAR" "$CRT_URL" "$CRT_SHA"
 
 # ---- compiler-rt builtins (generic C only: soft-float, 128-bit int helpers, atomics) ----
+# Built with the profile's ABI: lld refuses to mix lp64 and lp64d objects.
 if ! done_ builtins; then
   log "compiler-rt builtins"
   extract "$CRT_TAR" "compiler-rt-$CRT_VER.src"
@@ -111,7 +135,7 @@ if ! done_ musl; then
   mark musl
 fi
 
-# ---- kernel headers into the sysroot (busybox needs <linux/*.h>) ----
+# ---- kernel uapi headers into the sysroot (busybox needs <linux/*.h>) ----
 if ! done_ khdrs; then
   log "kernel uapi headers"
   extract "$LINUX_TAR" "linux-$LINUX_VER"
@@ -124,9 +148,9 @@ cat > "$CCW" <<EOF
 #!/bin/sh
 S=$SYSROOT
 B=$BUILTINS
-COMMON="--target=$TARGET -march=$MARCH -mabi=$MABI -nostdinc -isystem \$S/include -isystem \$(clang-$LLVM_VER -print-resource-dir)/include -Qunused-arguments"
+COMMON="$RVFLAGS -nostdinc -isystem \$S/include -isystem \$(clang-$LLVM_VER -print-resource-dir)/include -Qunused-arguments"
 for a in "\$@"; do case \$a in -c|-S|-E|-M|-MM) exec clang-$LLVM_VER \$COMMON "\$@";; esac; done
-exec clang-$LLVM_VER \$COMMON -fuse-ld=lld --ld-path=/usr/bin/ld.lld-$LLVM_VER -nostdlib -static -L\$S/lib \$S/lib/crt1.o \$S/lib/crti.o "\$@" -lc \$B \$S/lib/crtn.o
+exec clang-$LLVM_VER \$COMMON -fuse-ld=lld --ld-path=$LLD -nostdlib -static -no-pie -L\$S/lib \$S/lib/crt1.o \$S/lib/crti.o "\$@" -lc \$B \$S/lib/crtn.o
 EOF
 chmod +x "$CCW"
 
@@ -135,35 +159,35 @@ BBD=$SRC/busybox-$BB_VER
 # LD must be a real linker: busybox's default is "$(CC) -nostdlib", which would pull in crt1.o
 BBMAKE=(make -C "$BBD" HOSTCC=gcc CC="$CCW" LD=ld.lld-$LLVM_VER AR=llvm-ar-$LLVM_VER
         STRIP=llvm-strip-$LLVM_VER)
-if ! done_ busybox; then
+BB_OFF="TC FEATURE_INETD_RPC SELINUX SELINUXENABLED SETFILES RESTORECON MATCHPATHCON RUNCON
+  GETENFORCE SETENFORCE SESTATUS SETSEBOOL GETSEBOOL CHCON FEATURE_MOUNT_NFS FEATURE_MOUNT_CIFS
+  INETD STATIC_LIBGCC WERROR DEBUG PIE FEATURE_WGET_HTTPS FEATURE_WGET_OPENSSL"
+BB_ON="STATIC SH_IS_ASH ASH ASH_ALIAS FEATURE_EDITING FEATURE_USE_INITTAB INIT GETTY LOGIN
+  MOUNT UMOUNT UNAME CAT GREP ECHO LS PS SLEEP POWEROFF HALT REBOOT DMESG FREE TOP VI
+  MKFS_EXT2 MKE2FS IFCONFIG IP UDHCPC PING WGET NC HOSTNAME MKDIR FEATURE_IP_ADDRESS
+  FEATURE_IP_LINK FEATURE_IP_ROUTE AWK FEATURE_AWK_LIBM DD MD5SUM SHA256SUM SEQ SYNC DF DU
+  NPROC UPTIME DATE TIME HEAD TAIL WC SORT CUT TR HEXDUMP MKNOD ROUTE TELNET ARP TASKSET
+  FEATURE_TASKSET_FANCY"
+# The stamp name carries the applet selection, so editing the lists above rebuilds busybox.
+BB_STAMP=busybox-$(printf '%s|%s|%s|%s' "$BB_ON" "$BB_OFF" "$MARCH" "$MABI" | sha256sum | cut -c1-12)
+if ! done_ "$BB_STAMP"; then
   log "busybox $BB_VER"
   extract "$BB_TAR" "busybox-$BB_VER"
-  cd "$BBD"
-  make distclean >/dev/null 2>&1 || true
-  make HOSTCC=gcc defconfig >/dev/null
-  setcfg() { # SYM y|n
-    sed -i -e "/^# CONFIG_$1 is not set/d" -e "/^CONFIG_$1=/d" .config
-    if [ "$2" = y ]; then echo "CONFIG_$1=y" >> .config; else echo "# CONFIG_$1 is not set" >> .config; fi
-  }
-  setcfg STATIC y
-  setcfg PIE n
-  for s in TC FEATURE_INETD_RPC SELINUX SELINUXENABLED \
-           SETFILES RESTORECON MATCHPATHCON RUNCON GETENFORCE \
-           SETENFORCE SESTATUS SETSEBOOL GETSEBOOL SELINUXENABLED CHCON \
-           FEATURE_MOUNT_NFS FEATURE_MOUNT_CIFS INETD STATIC_LIBGCC \
-           WERROR DEBUG; do
-    setcfg "$s" n
-  done
-  for s in SH_IS_ASH ASH ASH_ALIAS FEATURE_EDITING FEATURE_USE_INITTAB INIT GETTY LOGIN \
-           MOUNT UMOUNT UNAME CAT GREP ECHO LS PS SLEEP POWEROFF HALT REBOOT DMESG FREE TOP VI \
-           MKFS_EXT2 IFCONFIG IP UDHCPC PING WGET NC HOSTNAME MKDIR FEATURE_IP_ADDRESS \
-           FEATURE_IP_LINK FEATURE_IP_ROUTE; do
-    setcfg "$s" y
-  done
-  make HOSTCC=gcc oldconfig < <(yes "") >/dev/null
-  "${BBMAKE[@]}" -j"$JOBS"
-  cd "$REPO"
-  mark busybox
+  ( cd "$BBD"
+    make distclean >/dev/null 2>&1 || true
+    make HOSTCC=gcc defconfig >/dev/null
+    setcfg() { # SYM y|n
+      sed -i -e "/^# CONFIG_$1 is not set/d" -e "/^CONFIG_$1=/d" .config
+      if [ "$2" = y ]; then echo "CONFIG_$1=y" >> .config; else echo "# CONFIG_$1 is not set" >> .config; fi
+    }
+    for s in $BB_OFF; do setcfg "$s" n; done
+    for s in $BB_ON; do setcfg "$s" y; done
+    make HOSTCC=gcc oldconfig < <(yes "") >/dev/null
+    for s in $BB_ON; do
+      grep -qx "CONFIG_$s=y" .config || { echo "busybox: CONFIG_$s not enabled after oldconfig" >&2; exit 1; }
+    done
+    "${BBMAKE[@]}" -j"$JOBS" )
+  mark "$BB_STAMP"
 fi
 BUSYBOX=$BBD/busybox
 
@@ -174,7 +198,6 @@ rm -rf "$STAGE"; mkdir -p "$STAGE"
 "${BBMAKE[@]}" CONFIG_PREFIX="$STAGE" install >/dev/null
 LIST=$OUT/initramfs.list
 declare -A have
-emit() { echo "$*"; }
 {
   # nodes.list carries the base dirs, /dev/console, /dev/null and /init
   cat platform/rootfs64/nodes.list
@@ -209,31 +232,67 @@ KD=$SRC/linux-$LINUX_VER
 KB=$W/kbuild
 extract "$LINUX_TAR" "linux-$LINUX_VER"
 log "kernel $LINUX_VER"
+export KBUILD_BUILD_USER=wiltee KBUILD_BUILD_HOST=wiltee KBUILD_BUILD_TIMESTAMP='Thu Jan  1 00:00:00 UTC 1970'
 KMAKE=(make -C "$KD" O="$KB" ARCH=riscv LLVM=-$LLVM_VER HOSTCC=gcc HOSTCXX=g++ -j"$JOBS")
 mkdir -p "$KB"
+CFG_BASE=platform/linux64.config
+CFG_PROFILE=platform/linux64-$PROFILE.config
+[ -f "$CFG_PROFILE" ] || { echo "missing $CFG_PROFILE" >&2; exit 1; }
 FRAG=$KB/linux64.frag
 # kconfig only accepts "# CONFIG_X is not set" for disabled bools, not CONFIG_X=n
-{ sed -E 's/^(CONFIG_[A-Za-z0-9_]+)=n$/# \1 is not set/' platform/linux64.config; echo "CONFIG_INITRAMFS_SOURCE=\"$LIST\""; } > "$FRAG"
-if [ ! -f "$KB/.config" ] || [ "$FRAG" -nt "$KB/.config" ] || [ platform/linux64.config -nt "$KB/.config" ]; then
+{ sed -E 's/^(CONFIG_[A-Za-z0-9_]+)=n$/# \1 is not set/' "$CFG_BASE" "$CFG_PROFILE"
+  echo "CONFIG_INITRAMFS_SOURCE=\"$LIST\""; } > "$FRAG.new"
+cmp -s "$FRAG.new" "$FRAG" && rm -f "$FRAG.new" || mv "$FRAG.new" "$FRAG"
+if [ ! -f "$KB/.config" ] || [ "$FRAG" -nt "$KB/.config" ]; then
   "${KMAKE[@]}" tinyconfig
   ( cd "$KD" && KCONFIG_CONFIG="$KB/.config" ARCH=riscv ./scripts/kconfig/merge_config.sh -m -O "$KB" "$KB/.config" "$FRAG" >/dev/null )
   "${KMAKE[@]}" olddefconfig
-  # merge_config -m runs olddefconfig-free; re-check requested symbols survived
+  # Every requested symbol must have survived olddefconfig (dependencies can silently override).
+  bad=0
   while IFS= read -r l; do
     case "$l" in CONFIG_*=*) ;; *) continue;; esac
     k=${l%%=*}; v=${l#*=}
     [ "$k" = CONFIG_INITRAMFS_SOURCE ] && continue
     if [ "$v" = n ]; then
-      grep -q "^$k=" "$KB/.config" && { echo "config: $k not disabled" >&2; exit 1; }
-    else
-      grep -qxF "$l" "$KB/.config" || echo "warning: $l not honoured by Kconfig" >&2
+      if grep -q "^$k=" "$KB/.config"; then echo "config: $k=n not honoured" >&2; bad=1; fi
+    elif ! grep -qxF "$l" "$KB/.config"; then
+      echo "config: $l not honoured (got: $(grep "^$k=" "$KB/.config" || echo unset))" >&2; bad=1
     fi
-  done < platform/linux64.config
+  done < <(cat "$CFG_BASE" "$CFG_PROFILE")
+  if [ $bad = 1 ]; then rm -f "$KB/.config"; echo "kernel config check failed" >&2; exit 1; fi
 fi
 "${KMAKE[@]}" Image
 
 cp "$KB/arch/riscv/boot/Image" "$OUT/Image"
 cp "$KB/vmlinux" "$OUT/vmlinux"
+cp "$KB/System.map" "$OUT/System.map"
 cp "$KB/.config" "$OUT/kernel.config"
+cp "$BUSYBOX" "$OUT/busybox"
 ls -l "$OUT/Image"
+
+# ---- instruction mix: what the profile promises must be what was emitted ----
+# Per ELF: total instructions, 2-byte (compressed) instructions, F/D instructions.
+isa_count() {
+  llvm-objdump-$LLVM_VER -d "$1" | awk '
+    /^[[:space:]]*[0-9a-f]+:[[:space:]]+[0-9a-f]+[[:space:]]/ {
+      n++; if (length($2) == 4) c++
+      if ($3 ~ /^(c\.)?f/ && $3 !~ /^fence/) fp++
+    }
+    END { printf "%d %d %d\n", n, c, fp }'
+}
+log "instruction mix ($PROFILE)"
+VDSO=$KB/arch/riscv/kernel/vdso/vdso.so.dbg
+fail=0
+for f in "$OUT/vmlinux" "$VDSO" "$OUT/busybox"; do
+  read -r n c fp < <(isa_count "$f")
+  printf '%-52s insns=%-8d compressed(2B)=%-7d fp=%d\n' "${f#"$REPO/"}" "$n" "$c" "$fp"
+  case $PROFILE in
+    ima)  [ "$c" = 0 ] && [ "$fp" = 0 ] || fail=1 ;;
+    imac) [ "$c" -gt 0 ] && [ "$fp" = 0 ] || fail=1 ;;
+    gc)   [ "$c" -gt 0 ] || fail=1
+          # C code in the kernel and vdso is soft-float; only fpu.S and busybox/musl use F/D
+          case $f in */vdso.so.dbg) ;; *) [ "$fp" -gt 0 ] || fail=1 ;; esac ;;
+  esac
+done
+[ $fail = 0 ] || { echo "instruction mix does not match profile $PROFILE" >&2; exit 1; }
 log "done: $OUT/Image"
