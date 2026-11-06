@@ -266,7 +266,7 @@ def boot(kernel: String, dtb: String, initrd: String, script: List<String>) -> I
     tr : Result<&1, &1, U32 & String, String> <- IO.get_env("WILTEE_TRACE")
     hs : Result<&1, &1, U32 & String, String> <- IO.get_env("WILTEE_HARTS")
     t0 : Nat <- IO.now()
-    host.loop(4294967295n, H.Mach.set_trace(trace.on(tr), H.Mach.new(m3, harts.of(hs), dtb.at(), 0)), script, False{}, 0, t0)
+    host.loop(4294967295n, H.Mach.set_trace(trace.on(tr), H.Mach.new(m3, 17n, harts.of(hs), dtb.at(), 0)), script, False{}, 0, t0)
 
 @unsafe
 def main.go(args: List<String>) -> IO(Unit):

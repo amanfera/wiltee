@@ -393,7 +393,7 @@ type Csr is Data:
 # go: keep running (the slice loop ends a slice on False)
 # ph, pl: the pc; n: low word of the instruction count, also `time`
 # md: hot-path mode: bit0 S-mode, bit1 SUM, bit2 MXR, bit3 Sv39 on,
-#     bit4 FP on (FS != 0), bit5 FP state dirty (FS = 3)
+#     bit4 FP on (FS != 0), bit5 FP state dirty (FS = 3), bit6 COW fork
 # fv, fp: fetch tag and physical page of the last fetch (fv = 1: none)
 # x: registers, m: RAM, s: CSRs, d: device words, t: TLB
 type Hart is Type:
@@ -459,8 +459,6 @@ def P.IE() -> U32:
   22
 def P.TH() -> U32:
   23
-# RX ring: 256 bytes at 256. TX buffer: 65536 bytes at 65536, drained by the
-# host after every epoch.
 # SMP: the hart count, the running hart, the quantum of a turn, the budget
 # left in the epoch (D.LEFT is the turn's), and turns in a row without work.
 def D.NHART() -> U32:
@@ -473,6 +471,19 @@ def D.LALL() -> U32:
   27
 def D.IDLE() -> U32:
   28
+# The console TX buffer: base and capacity in d (the host sizes d).
+def D.TXB() -> U32:
+  29
+def D.TXC() -> U32:
+  30
+# Copy-on-write forks: the page a translation missed (page | 2), the next
+# free pool page and the pool's size in pages.
+def D.MISS() -> U32:
+  31
+def D.PNEXT() -> U32:
+  32
+def D.PCAP() -> U32:
+  33
 
 # Per-hart words of hart h at 512 + 16h: a parked hart's timer, STIP and
 # WFI (the running hart's live at D.CL, D.CH, D.STIP, D.WFI), IPIs and remote
@@ -499,10 +510,11 @@ def HW.FLUSH() -> U32:
 def pctx(+c: U32) -> U32:
   U32.add(768, U32.shln(U32.and(c, 15), 2n))
 
+# RX ring: 256 bytes at 256. The TX buffer (one byte per word at D.TXB, up
+# to D.TXC bytes) collects console output until the host drains it, which
+# may be many epochs later.
 def U.RX() -> U32:
   256
-def U.TX() -> U32:
-  65536
 
 def md.of(+priv: U32, +st: U32, +sah: U32) -> U32:
   +fs = U32.and(U32.shrn(st, 13n), 3)
@@ -546,7 +558,7 @@ def trap(+ph: U32, +pl: U32, +il: U32, +n: U32, +md: U32, +fv: U32, +fp: U32, x:
   +st2 = U32.or(U32.and(st, 4294967005), U32.or(U32.shln(pr, 8n), U32.shln(U32.and(st, 2), 4n)))
   +base = U32.and(tvl, 4294967292)
   +vec = sel(Bool.and(isneg(cause), U32.is_eq(U32.and(tvl, 3), 1)), U32.add(base, U32.shln(U32.and(cause, 31), 2n)), base)
-  Hart{True{}, tvh, vec, n, md.of(1, st2, sah), 1, fp, x, m, Csr{1, st2, ie, ip, tvh, tvl, sch, scl, ph, pl, cause, vh, vl, sah, sal, cen, env}, d, t}
+  Hart{True{}, tvh, vec, n, U32.or(md.of(1, st2, sah), U32.and(md, 64)), 1, fp, x, m, Csr{1, st2, ie, ip, tvh, tvl, sch, scl, ph, pl, cause, vh, vl, sah, sal, cen, env}, d, t}
 
 def illegal(+ph: U32, +pl: U32, +il: U32, +n: U32, +md: U32, +fv: U32, +fp: U32, x: Array<U32>, m: Array<U32>, s: Csr, d: Array<U32>, t: Array<U32>, +inst: U32) -> Hart:
   trap(ph, pl, il, n, md, fv, fp, x, m, s, d, t, 2, 0, inst)
@@ -603,6 +615,58 @@ def jmp(+ph: U32, +pl: U32, +il: U32, +n: U32, +md: U32, +fv: U32, +fp: U32, x: 
   x[1] <- 0
   Hart{True{}, th, tl, n, md, sel(U32.is_eq(th, ph), fv, 1), fp, x, m, s, d, t}
 
+# Copy-on-write forks
+# -------------------
+# A fork of a snapshot owns only the pages it has touched. Its RAM array
+# starts with a page directory: m[g] = pool page holding guest page g, 0 when
+# the page is still only in the snapshot. Translations hand out pool pages,
+# so the TLB and the fetch tag point straight into the pool and hits cost
+# nothing extra. A guest page that is not in the pool yet is a miss: the
+# instruction stops before any side effect (EXIT 4, the page in D.MISS) and
+# runs again once the fleet has copied the page in between epochs.
+
+def pdx.k(+e: U32, +ga: U32) -> U32:
+  sel(U32.is_zero(e), U32.or(U32.and(ga, 4294963200), 2), U32.or(U32.shln(e, 12n), U32.and(ga, 4095)))
+
+def pdx.r(+ga: U32, p: Array<U32> & U32) -> R2:
+  (m, +e) = p
+  R2{m, pdx.k(e, ga), 0}
+
+def pdx.c(+ram: Bool, m: Array<U32>, +ga: U32) -> R2:
+  match ram:
+    case True{}:
+      pdx.r(ga, Array.get(U32, m, U32.shrn(ga, 12n)))
+    case False{}:
+      R2{m, ga, 0}
+
+# The address a guest-physical address has in m: itself, or for a COW fork
+# its pool address (or the page | 2 on a miss). Devices are not translated.
+def pdx(+cow: Bool, m: Array<U32>, +ga: U32) -> R2:
+  match cow:
+    case False{}:
+      R2{m, ga, 0}
+    case True{}:
+      pdx.c(U32.is_lt(ga, RAM()), m, ga)
+
+def get2.at(+a: U32, r: R2) -> R3:
+  R2{m, lo, hi} = r
+  R3{m, a, lo, hi}
+
+def pte.rd.k(+miss: Bool, m: Array<U32>, +a: U32) -> R3:
+  match miss:
+    case True{}:
+      R3{m, a, 0, 0}
+    case False{}:
+      get2.at(a, get2(m, U32.shrn(a, 2n), U32.add(U32.shrn(a, 2n), 1)))
+
+def pte.rd.a(r: R2) -> R3:
+  R2{m, +a, z} = r
+  pte.rd.k(nz(U32.and(a, 2)), m, a)
+
+# A PTE at guest-physical ga: (m, its address in m or a miss, lo, hi).
+def pte.rd(+cow: Bool, m: Array<U32>, +ga: U32) -> R3:
+  pte.rd.a(pdx(cow, m, ga))
+
 # MMU (Sv39)
 # ----------
 
@@ -630,13 +694,17 @@ def perm(+f: U32, +kind: U32, +md: U32) -> Bool:
   +ok = sel(U32.is_eq(kind, 0), bit(rx), sel(U32.is_eq(kind, 1), bit(nz(U32.and(f, 4))), bit(nz(U32.and(f, 8)))))
   nz(U32.and(pv, ok))
 
-# 0: invalid, 1: leaf, 2: pointer to the next level (inside RAM). A PTE
-# whose physical page lies at or above 4 GiB, or with reserved bits set,
-# is invalid here: wiltee's physical address space is below 4 GiB.
+# 0: invalid, 1: leaf, 2: pointer to the next level (inside RAM), 3: the
+# PTE's page missed in a COW fork. A PTE whose physical page lies at or
+# above 4 GiB, or with reserved bits set, is invalid here: wiltee's physical
+# address space is below 4 GiB.
 def pte.cls(+lo: U32, +hi: U32) -> U32:
   +bad = Bool.or(Bool.or(nz(hi), nz(U32.shrn(lo, 30n))), Bool.or(U32.is_zero(U32.and(lo, 1)), U32.is_eq(U32.and(lo, 6), 4)))
   +leaf = nz(U32.and(lo, 10))
   sel(bad, 0, sel(leaf, 1, sel(U32.is_lt(U32.shln(U32.shrn(lo, 10n), 12n), RAM()), 2, 0)))
+
+def pte.cls3(+a: U32, +lo: U32, +hi: U32) -> U32:
+  sel(nz(U32.and(a, 2)), 3, pte.cls(lo, hi))
 
 # The 4 KiB physical page of va inside a leaf at level lv (0: 4K, 1: 2M,
 # 2: 1G), or 1 when a superpage is misaligned.
@@ -649,65 +717,81 @@ def leaf.pg(+lv: U32, +lo: U32, +vl: U32) -> U32:
     case _:
       sel(nz(U32.and(U32.shrn(lo, 10n), 262143)), 1, U32.or(U32.shln(U32.shrn(lo, 28n), 30n), U32.and(vl, 1073737728)))
 
-# A leaf passed its checks: set A (and D on a store), fill the TLB.
-def walk.fill(+ok: Bool, m: Array<U32>, s: Csr, t: Array<U32>, +kind: U32, +vh: U32, +vl: U32, +a: U32, +pte: U32, +pg: U32) -> Wk:
+def walk.tlb(+miss: Bool, m: Array<U32>, s: Csr, t: Array<U32>, +vh: U32, +vl: U32, +np: U32, +pg: U32) -> Wk:
+  match miss:
+    case True{}:
+      Wk{m, s, t, pg}
+    case False{}:
+      +i = U32.shln(U32.and(U32.shrn(vl, 12n), 255), 1n)
+      t[i] <- tag.of(vh, vl)
+      t[U32.add(i, 1)] <- U32.or(pg, U32.and(np, 255))
+      Wk{m, s, t, pg}
+
+def walk.pg(s: Csr, t: Array<U32>, +vh: U32, +vl: U32, +np: U32, r: R2) -> Wk:
+  R2{m, +pg, z} = r
+  walk.tlb(nz(U32.and(pg, 2)), m, s, t, vh, vl, np, pg)
+
+# A leaf passed its checks: set A (and D on a store), fill the TLB with the
+# page's address in m.
+def walk.fill(+ok: Bool, m: Array<U32>, s: Csr, t: Array<U32>, +md: U32, +kind: U32, +vh: U32, +vl: U32, +a: U32, +pte: U32, +pg: U32) -> Wk:
   match ok:
     case False{}:
       Wk{m, s, t, 1}
     case True{}:
       +np = U32.or(pte, sel(U32.is_eq(kind, 1), 192, 64))
       m[U32.shrn(a, 2n)] <- np
-      +i = U32.shln(U32.and(U32.shrn(vl, 12n), 255), 1n)
-      t[i] <- tag.of(vh, vl)
-      t[U32.add(i, 1)] <- U32.or(pg, U32.and(np, 255))
-      Wk{m, s, t, pg}
+      walk.pg(s, t, vh, vl, np, pdx(nz(U32.and(md, 64)), m, pg))
 
 def walk.leaf(+pg: U32, m: Array<U32>, s: Csr, t: Array<U32>, +md: U32, +kind: U32, +vh: U32, +vl: U32, +a: U32, +pte: U32) -> Wk:
-  walk.fill(Bool.and(U32.is_ne(pg, 1), perm(pte, kind, md)), m, s, t, kind, vh, vl, a, pte, pg)
+  walk.fill(Bool.and(U32.is_ne(pg, 1), perm(pte, kind, md)), m, s, t, md, kind, vh, vl, a, pte, pg)
 
 def walk.l0k(+c: U32, m: Array<U32>, s: Csr, t: Array<U32>, +md: U32, +kind: U32, +vh: U32, +vl: U32, +a: U32, +lo: U32) -> Wk:
   match c:
     case 1:
       walk.leaf(leaf.pg(0, lo, vl), m, s, t, md, kind, vh, vl, a, lo)
+    case 3:
+      Wk{m, s, t, a}
     case _:
       Wk{m, s, t, 1}
 
-def walk.l0(s: Csr, t: Array<U32>, +md: U32, +kind: U32, +vh: U32, +vl: U32, +a: U32, r: R2) -> Wk:
-  R2{m, +lo, +hi} = r
-  walk.l0k(pte.cls(lo, hi), m, s, t, md, kind, vh, vl, a, lo)
+def walk.l0(s: Csr, t: Array<U32>, +md: U32, +kind: U32, +vh: U32, +vl: U32, r: R3) -> Wk:
+  R3{m, +a, +lo, +hi} = r
+  walk.l0k(pte.cls3(a, lo, hi), m, s, t, md, kind, vh, vl, a, lo)
 
 def walk.l1k(+c: U32, m: Array<U32>, s: Csr, t: Array<U32>, +md: U32, +kind: U32, +vh: U32, +vl: U32, +a: U32, +lo: U32) -> Wk:
   match c:
     case 1:
       walk.leaf(leaf.pg(1, lo, vl), m, s, t, md, kind, vh, vl, a, lo)
     case 2:
-      +a0 = U32.add(U32.shln(U32.shrn(lo, 10n), 12n), U32.shln(U32.and(U32.shrn(vl, 12n), 511), 3n))
-      walk.l0(s, t, md, kind, vh, vl, a0, get2(m, U32.shrn(a0, 2n), U32.add(U32.shrn(a0, 2n), 1)))
+      walk.l0(s, t, md, kind, vh, vl, pte.rd(nz(U32.and(md, 64)), m, U32.add(U32.shln(U32.shrn(lo, 10n), 12n), U32.shln(U32.and(U32.shrn(vl, 12n), 511), 3n))))
+    case 3:
+      Wk{m, s, t, a}
     case _:
       Wk{m, s, t, 1}
 
-def walk.l1(s: Csr, t: Array<U32>, +md: U32, +kind: U32, +vh: U32, +vl: U32, +a: U32, r: R2) -> Wk:
-  R2{m, +lo, +hi} = r
-  walk.l1k(pte.cls(lo, hi), m, s, t, md, kind, vh, vl, a, lo)
+def walk.l1(s: Csr, t: Array<U32>, +md: U32, +kind: U32, +vh: U32, +vl: U32, r: R3) -> Wk:
+  R3{m, +a, +lo, +hi} = r
+  walk.l1k(pte.cls3(a, lo, hi), m, s, t, md, kind, vh, vl, a, lo)
 
 def walk.l2k(+c: U32, m: Array<U32>, s: Csr, t: Array<U32>, +md: U32, +kind: U32, +vh: U32, +vl: U32, +a: U32, +lo: U32) -> Wk:
   match c:
     case 1:
       walk.leaf(leaf.pg(2, lo, vl), m, s, t, md, kind, vh, vl, a, lo)
     case 2:
-      +a1 = U32.add(U32.shln(U32.shrn(lo, 10n), 12n), U32.shln(U32.and(U32.shrn(vl, 21n), 511), 3n))
-      walk.l1(s, t, md, kind, vh, vl, a1, get2(m, U32.shrn(a1, 2n), U32.add(U32.shrn(a1, 2n), 1)))
+      walk.l1(s, t, md, kind, vh, vl, pte.rd(nz(U32.and(md, 64)), m, U32.add(U32.shln(U32.shrn(lo, 10n), 12n), U32.shln(U32.and(U32.shrn(vl, 21n), 511), 3n))))
+    case 3:
+      Wk{m, s, t, a}
     case _:
       Wk{m, s, t, 1}
 
-def walk.l2(s: Csr, t: Array<U32>, +md: U32, +kind: U32, +vh: U32, +vl: U32, +a: U32, r: R2) -> Wk:
-  R2{m, +lo, +hi} = r
-  walk.l2k(pte.cls(lo, hi), m, s, t, md, kind, vh, vl, a, lo)
+def walk.l2(s: Csr, t: Array<U32>, +md: U32, +kind: U32, +vh: U32, +vl: U32, r: R3) -> Wk:
+  R3{m, +a, +lo, +hi} = r
+  walk.l2k(pte.cls3(a, lo, hi), m, s, t, md, kind, vh, vl, a, lo)
 
 def walk.root(+ok: Bool, m: Array<U32>, s: Csr, t: Array<U32>, +md: U32, +kind: U32, +vh: U32, +vl: U32, +a: U32) -> Wk:
   match ok:
     case True{}:
-      walk.l2(s, t, md, kind, vh, vl, a, get2(m, U32.shrn(a, 2n), U32.add(U32.shrn(a, 2n), 1)))
+      walk.l2(s, t, md, kind, vh, vl, pte.rd(nz(U32.and(md, 64)), m, a))
     case False{}:
       Wk{m, s, t, 1}
 
@@ -738,15 +822,21 @@ def xl.c(+canon: Bool, m: Array<U32>, s: Csr, t: Array<U32>, +md: U32, +kind: U3
     case False{}:
       Wk{m, s, t, 1}
 
+def xl.bare(s: Csr, t: Array<U32>, r: R2) -> Wk:
+  R2{m, pg, z} = r
+  Wk{m, s, t, pg}
+
 def xl.b(+on: Bool, m: Array<U32>, s: Csr, t: Array<U32>, +md: U32, +kind: U32, +vh: U32, +vl: U32) -> Wk:
   match on:
     case False{}:
-      Wk{m, s, t, sel(U32.is_zero(vh), U32.and(vl, 4294963200), 1)}
+      xl.bare(s, t, pdx(Bool.and(nz(U32.and(md, 64)), U32.is_zero(vh)), m, sel(U32.is_zero(vh), U32.and(vl, 4294963200), 1)))
     case True{}:
       xl.c(U32.is_zero(U32.shrn(U32.add(vh, 64), 7n)), m, s, t, md, kind, vh, vl)
 
 # Translates va = (vh, vl) for an access of `kind`; the TLB first, then the
-# walk. With the MMU off, physical addresses above 4 GiB fault.
+# walk. r: the page's address in m (devices: their physical page), r = 1 a
+# fault, r = page | 2 a COW miss. With the MMU off, addresses above 4 GiB
+# fault.
 def xl(m: Array<U32>, s: Csr, t: Array<U32>, +md: U32, +kind: U32, +vh: U32, +vl: U32) -> Wk:
   xl.b(nz(U32.and(md, 8)), m, s, t, md, kind, vh, vl)
 
@@ -780,22 +870,22 @@ def dev.upd.a(r: R3) -> Array<U32>:
 def dev.upd(d: Array<U32>) -> Array<U32>:
   dev.upd.a(get3(d, U.IER(), U.RXH(), U.RXT()))
 
-def dev.tx.at(+ok: Bool, d: Array<U32>, +k: U32, +b: U32) -> Array<U32>:
+def dev.tx.at(+ok: Bool, d: Array<U32>, +base: U32, +k: U32, +b: U32) -> Array<U32>:
   match ok:
     case True{}:
-      d[U32.add(U.TX(), k)] <- b
+      d[U32.add(base, k)] <- b
       d[U.TXN()] <- U32.add(k, 1)
       d
     case False{}:
       d
 
-def tx.push.k(+b: U32, p: Array<U32> & U32) -> Array<U32>:
-  (d, +k) = p
-  dev.tx.at(U32.is_lt(k, 65536), d, k, b)
+def tx.push.k(+b: U32, r: R3) -> Array<U32>:
+  R3{d, +k, +base, +cap} = r
+  dev.tx.at(U32.is_lt(k, cap), d, base, k, b)
 
-# Appends a byte to the TX buffer the host drains after each epoch.
+# Appends a byte to the TX buffer the host drains; a full buffer drops it.
 def tx.push(d: Array<U32>, +b: U32) -> Array<U32>:
-  tx.push.k(U32.and(b, 255), Array.get(U32, d, U.TXN()))
+  tx.push.k(U32.and(b, 255), get3(d, U.TXN(), D.TXB(), D.TXC()))
 
 def rx.pop.v(+h: U32, p: Array<U32> & U32) -> R2:
   (d, v) = p
@@ -1005,6 +1095,13 @@ def io.wr.k(+dev: U32, +pa: U32, +v: U32, d: Array<U32>) -> R2:
 def io.wr(+pa: U32, +v: U32, d: Array<U32>) -> R2:
   io.wr.k(sel(U32.is_lt(U32.sub(pa, 4026531840), 67108864), 15, U32.shrn(pa, 24n)), pa, v, d)
 
+# A COW miss: the instruction has had no effect; park the hart on it (its
+# count included) until the fleet has copied page r in.
+def miss(+ph: U32, +pl: U32, +n: U32, +md: U32, +fv: U32, +fp: U32, x: Array<U32>, m: Array<U32>, s: Csr, d: Array<U32>, t: Array<U32>, +r: U32) -> Hart:
+  d[D.MISS()] <- r
+  d[D.EXIT()] <- 4
+  Hart{False{}, ph, pl, U32.sub(n, 1), md, fv, fp, x, m, s, d, t}
+
 # Loads
 # -----
 
@@ -1060,16 +1157,18 @@ def ld.p(+ram: Bool, +ph: U32, +pl: U32, +il: U32, +n: U32, +md: U32, +fv: U32, 
     case False{}:
       ld.io(ph, pl, il, n, md, fv, fp, x, m, s, io.rd(pa, d), t, rd, f3, vh, vl)
 
-def ld.f(+fault: Bool, +ph: U32, +pl: U32, +il: U32, +n: U32, +md: U32, +fv: U32, +fp: U32, x: Array<U32>, m: Array<U32>, s: Csr, d: Array<U32>, t: Array<U32>, +rd: U32, +f3: U32, +vh: U32, +vl: U32, +pa: U32) -> Hart:
-  match fault:
-    case True{}:
+def ld.f(+c: U32, +ph: U32, +pl: U32, +il: U32, +n: U32, +md: U32, +fv: U32, +fp: U32, x: Array<U32>, m: Array<U32>, s: Csr, d: Array<U32>, t: Array<U32>, +rd: U32, +f3: U32, +vh: U32, +vl: U32, +r: U32) -> Hart:
+  match c:
+    case 0:
+      ld.p(U32.is_lt(r, RAM()), ph, pl, il, n, md, fv, fp, x, m, s, d, t, rd, f3, vh, vl, U32.or(r, U32.and(vl, 4095)))
+    case 2:
+      miss(ph, pl, n, md, fv, fp, x, m, s, d, t, r)
+    case _:
       trap(ph, pl, il, n, md, fv, fp, x, m, s, d, t, 13, vh, vl)
-    case False{}:
-      ld.p(U32.is_lt(pa, RAM()), ph, pl, il, n, md, fv, fp, x, m, s, d, t, rd, f3, vh, vl, pa)
 
 def ld.w(+ph: U32, +pl: U32, +il: U32, +n: U32, +md: U32, +fv: U32, +fp: U32, x: Array<U32>, w: Wk, d: Array<U32>, +rd: U32, +f3: U32, +vh: U32, +vl: U32) -> Hart:
   Wk{m, s, t, +r} = w
-  ld.f(nz(U32.and(r, 1)), ph, pl, il, n, md, fv, fp, x, m, s, d, t, rd, f3, vh, vl, U32.or(r, U32.and(vl, 4095)))
+  ld.f(U32.and(r, 3), ph, pl, il, n, md, fv, fp, x, m, s, d, t, rd, f3, vh, vl, r)
 
 def ld.b(+mis: Bool, +ph: U32, +pl: U32, +il: U32, +n: U32, +md: U32, +fv: U32, +fp: U32, x: Array<U32>, m: Array<U32>, s: Csr, d: Array<U32>, t: Array<U32>, +rd: U32, +f3: U32, +vh: U32, +vl: U32) -> Hart:
   match mis:
@@ -1147,16 +1246,18 @@ def st.p(+ram: Bool, +ph: U32, +pl: U32, +il: U32, +n: U32, +md: U32, +fv: U32, 
     case False{}:
       st.io(ph, pl, il, n, md, fv, fp, x, m, s, io.wr(pa, st.merge(f3, 0, 0, sl), d), t, vh, vl)
 
-def st.f(+fault: Bool, +ph: U32, +pl: U32, +il: U32, +n: U32, +md: U32, +fv: U32, +fp: U32, x: Array<U32>, m: Array<U32>, s: Csr, d: Array<U32>, t: Array<U32>, +f3: U32, +vh: U32, +vl: U32, +pa: U32, +sh: U32, +sl: U32) -> Hart:
-  match fault:
-    case True{}:
+def st.f(+c: U32, +ph: U32, +pl: U32, +il: U32, +n: U32, +md: U32, +fv: U32, +fp: U32, x: Array<U32>, m: Array<U32>, s: Csr, d: Array<U32>, t: Array<U32>, +f3: U32, +vh: U32, +vl: U32, +r: U32, +sh: U32, +sl: U32) -> Hart:
+  match c:
+    case 0:
+      st.p(U32.is_lt(r, RAM()), ph, pl, il, n, md, fv, fp, x, m, s, d, t, f3, vh, vl, U32.or(r, U32.and(vl, 4095)), sh, sl)
+    case 2:
+      miss(ph, pl, n, md, fv, fp, x, m, s, d, t, r)
+    case _:
       trap(ph, pl, il, n, md, fv, fp, x, m, s, d, t, 15, vh, vl)
-    case False{}:
-      st.p(U32.is_lt(pa, RAM()), ph, pl, il, n, md, fv, fp, x, m, s, d, t, f3, vh, vl, pa, sh, sl)
 
 def st.w(+ph: U32, +pl: U32, +il: U32, +n: U32, +md: U32, +fv: U32, +fp: U32, x: Array<U32>, w: Wk, d: Array<U32>, +f3: U32, +vh: U32, +vl: U32, +sh: U32, +sl: U32) -> Hart:
   Wk{m, s, t, +r} = w
-  st.f(nz(U32.and(r, 1)), ph, pl, il, n, md, fv, fp, x, m, s, d, t, f3, vh, vl, U32.or(r, U32.and(vl, 4095)), sh, sl)
+  st.f(U32.and(r, 3), ph, pl, il, n, md, fv, fp, x, m, s, d, t, f3, vh, vl, r, sh, sl)
 
 def st.b(+mis: Bool, +ph: U32, +pl: U32, +il: U32, +n: U32, +md: U32, +fv: U32, +fp: U32, x: Array<U32>, m: Array<U32>, s: Csr, d: Array<U32>, t: Array<U32>, +f3: U32, +vh: U32, +vl: U32, +sh: U32, +sl: U32) -> Hart:
   match mis:
@@ -1292,16 +1393,18 @@ def amo.p(+ram: Bool, +dw: Bool, +f5: U32, +ph: U32, +pl: U32, +il: U32, +n: U32
     case False{} _:
       trap(ph, pl, il, n, md, fv, fp, x, m, s, d, t, sel(U32.is_eq(f5, 2), 5, 7), ah, al)
 
-def amo.f2(+fault: Bool, +dw: Bool, +f5: U32, +ph: U32, +pl: U32, +il: U32, +n: U32, +md: U32, +fv: U32, +fp: U32, x: Array<U32>, m: Array<U32>, s: Csr, d: Array<U32>, t: Array<U32>, +rd: U32, +ah: U32, +al: U32, +pa: U32, +vh: U32, +vl: U32) -> Hart:
-  match fault:
-    case True{}:
+def amo.f2(+c: U32, +dw: Bool, +f5: U32, +ph: U32, +pl: U32, +il: U32, +n: U32, +md: U32, +fv: U32, +fp: U32, x: Array<U32>, m: Array<U32>, s: Csr, d: Array<U32>, t: Array<U32>, +rd: U32, +ah: U32, +al: U32, +r: U32, +vh: U32, +vl: U32) -> Hart:
+  match c:
+    case 0:
+      amo.p(U32.is_lt(r, RAM()), dw, f5, ph, pl, il, n, md, fv, fp, x, m, s, d, t, rd, ah, al, U32.or(r, U32.and(al, 4095)), vh, vl)
+    case 2:
+      miss(ph, pl, n, md, fv, fp, x, m, s, d, t, r)
+    case _:
       trap(ph, pl, il, n, md, fv, fp, x, m, s, d, t, sel(U32.is_eq(f5, 2), 13, 15), ah, al)
-    case False{}:
-      amo.p(U32.is_lt(pa, RAM()), dw, f5, ph, pl, il, n, md, fv, fp, x, m, s, d, t, rd, ah, al, pa, vh, vl)
 
 def amo.w(+dw: Bool, +f5: U32, +ph: U32, +pl: U32, +il: U32, +n: U32, +md: U32, +fv: U32, +fp: U32, x: Array<U32>, w: Wk, d: Array<U32>, +rd: U32, +ah: U32, +al: U32, +vh: U32, +vl: U32) -> Hart:
   Wk{m, s, t, +r} = w
-  amo.f2(nz(U32.and(r, 1)), dw, f5, ph, pl, il, n, md, fv, fp, x, m, s, d, t, rd, ah, al, U32.or(r, U32.and(al, 4095)), vh, vl)
+  amo.f2(U32.and(r, 3), dw, f5, ph, pl, il, n, md, fv, fp, x, m, s, d, t, rd, ah, al, r, vh, vl)
 
 def amo.b(+mis: Bool, +dw: Bool, +f5: U32, +ph: U32, +pl: U32, +il: U32, +n: U32, +md: U32, +fv: U32, +fp: U32, x: Array<U32>, m: Array<U32>, s: Csr, d: Array<U32>, t: Array<U32>, +rd: U32, +ah: U32, +al: U32, +vh: U32, +vl: U32) -> Hart:
   match mis:
@@ -1639,9 +1742,9 @@ def csr.tlb(+sp: Bool, t: Array<U32>) -> Array<U32>:
 
 # Any CSR write ends the slice and drops the fetch tag; a satp write also
 # flushes the TLB.
-def csr.fin(+sp: Bool, +ph: U32, +pl: U32, +il: U32, +n: U32, +fv: U32, +fp: U32, x: Array<U32>, m: Array<U32>, s: Csr, d: Array<U32>, t: Array<U32>, +rd: U32, +oh: U32, +ol: U32) -> Hart:
+def csr.fin(+sp: Bool, +ph: U32, +pl: U32, +il: U32, +n: U32, +md: U32, +fv: U32, +fp: U32, x: Array<U32>, m: Array<U32>, s: Csr, d: Array<U32>, t: Array<U32>, +rd: U32, +oh: U32, +ol: U32) -> Hart:
   Csr{+pr, +st, ie, ip, tvh, tvl, sch, scl, eph, epl, ca, tlh, tll, +sah, sal, cen, env} = s
-  wr.stop(ph, pl, il, n, md.of(pr, st, sah), 1, fp, x, m, Csr{pr, st, ie, ip, tvh, tvl, sch, scl, eph, epl, ca, tlh, tll, sah, sal, cen, env}, d, csr.tlb(sp, t), rd, oh, ol)
+  wr.stop(ph, pl, il, n, U32.or(md.of(pr, st, sah), U32.and(md, 64)), 1, fp, x, m, Csr{pr, st, ie, ip, tvh, tvl, sch, scl, eph, epl, ca, tlh, tll, sah, sal, cen, env}, d, csr.tlb(sp, t), rd, oh, ol)
 
 def csr.fcsr(+num: U32, +v: U32, +fc: U32) -> U32:
   match num:
@@ -1670,7 +1773,7 @@ def csr.go(+ok: Bool, +write: Bool, +fpc: Bool, +num: U32, old: W, +sh: U32, +sl
     case True{} True{} False{}:
       W{+oh, +ol} = old
       Csr{pr, st, ie, ip, tvh, tvl, sch, scl, eph, epl, ca, tlh, tll, sah, sal, cen, env} = s
-      csr.fin(U32.is_eq(num, 384), ph, pl, il, n, fv, fp, x, m, csr.put(num, csr.new(op, oh, sh), csr.new(op, ol, sl), pr, st, ie, ip, tvh, tvl, sch, scl, eph, epl, ca, tlh, tll, sah, sal, cen, env), d, t, rd, oh, ol)
+      csr.fin(U32.is_eq(num, 384), ph, pl, il, n, md, fv, fp, x, m, csr.put(num, csr.new(op, oh, sh), csr.new(op, ol, sl), pr, st, ie, ip, tvh, tvl, sch, scl, eph, epl, ca, tlh, tll, sah, sal, cen, env), d, t, rd, oh, ol)
     case True{} True{} True{}:
       W{+oh, +ol} = old
       csr.fpw(num, csr.new(op, ol, sl), fc, ph, pl, il, n, md, fv, fp, x, m, s, d, t, rd, oh, ol)
@@ -1892,7 +1995,7 @@ def i.sret(+ph: U32, +pl: U32, +il: U32, +n: U32, +md: U32, +fv: U32, +fp: U32, 
   Csr{pr, +st, ie, ip, tvh, tvl, sch, scl, +eph, +epl, ca, tlh, tll, +sah, sal, cen, env} = s
   +np = U32.and(U32.shrn(st, 8n), 1)
   +st2 = U32.or(U32.and(st, 4294967005), U32.or(32, U32.and(U32.shrn(st, 4n), 2)))
-  Hart{False{}, eph, epl, n, md.of(np, st2, sah), 1, fp, x, m, Csr{np, st2, ie, ip, tvh, tvl, sch, scl, eph, epl, ca, tlh, tll, sah, sal, cen, env}, d, t}
+  Hart{False{}, eph, epl, n, U32.or(md.of(np, st2, sah), U32.and(md, 64)), 1, fp, x, m, Csr{np, st2, ie, ip, tvh, tvl, sch, scl, eph, epl, ca, tlh, tll, sah, sal, cen, env}, d, t}
 
 def i.wfi(+ph: U32, +pl: U32, +il: U32, +n: U32, +md: U32, +fv: U32, +fp: U32, x: Array<U32>, m: Array<U32>, s: Csr, d: Array<U32>, t: Array<U32>) -> Hart:
   d[D.WFI()] <- 1
@@ -2016,17 +2119,19 @@ def fetch.x2.ok(+ram: Bool, +lo: U32, +ph: U32, +pl: U32, +n: U32, +md: U32, +fv
       trap(ph, pl, 4, n, md, fv, fp, x, m, s, d, t, 1, U32.add(ph, bit(U32.is_lt(ql, 2))), ql)
 
 # stval must name the second page: that is the one Linux has to map.
-def fetch.x2.f(+fault: Bool, +lo: U32, +ph: U32, +pl: U32, +n: U32, +md: U32, +fv: U32, +fp: U32, x: Array<U32>, m: Array<U32>, s: Csr, d: Array<U32>, t: Array<U32>, +r: U32) -> Hart:
-  match fault:
-    case True{}:
+def fetch.x2.f(+c: U32, +lo: U32, +ph: U32, +pl: U32, +n: U32, +md: U32, +fv: U32, +fp: U32, x: Array<U32>, m: Array<U32>, s: Csr, d: Array<U32>, t: Array<U32>, +r: U32) -> Hart:
+  match c:
+    case 0:
+      fetch.x2.ok(U32.is_lt(r, RAM()), lo, ph, pl, n, md, fv, fp, x, m, s, d, t, r)
+    case 2:
+      miss(ph, pl, n, md, fv, fp, x, m, s, d, t, r)
+    case _:
       +ql = U32.add(pl, 2)
       trap(ph, pl, 4, n, md, fv, fp, x, m, s, d, t, 12, U32.add(ph, bit(U32.is_lt(ql, 2))), ql)
-    case False{}:
-      fetch.x2.ok(U32.is_lt(r, RAM()), lo, ph, pl, n, md, fv, fp, x, m, s, d, t, r)
 
 def fetch.x2.w(+lo: U32, +ph: U32, +pl: U32, +n: U32, +md: U32, +fv: U32, +fp: U32, x: Array<U32>, w: Wk, d: Array<U32>) -> Hart:
   Wk{m, s, t, +r} = w
-  fetch.x2.f(nz(U32.and(r, 1)), lo, ph, pl, n, md, fv, fp, x, m, s, d, t, r)
+  fetch.x2.f(U32.and(r, 3), lo, ph, pl, n, md, fv, fp, x, m, s, d, t, r)
 
 def fetch.x(+cross: Bool, +lo: U32, +ph: U32, +pl: U32, +n: U32, +md: U32, +fv: U32, +fp: U32, x: Array<U32>, m: Array<U32>, s: Csr, d: Array<U32>, t: Array<U32>) -> Hart:
   match cross:
@@ -2068,16 +2173,18 @@ def fetch.ok(+ram: Bool, +ph: U32, +pl: U32, +n: U32, +md: U32, +fv: U32, +fp: U
     case False{}:
       trap(ph, pl, 4, n, md, fv, fp, x, m, s, d, t, 1, ph, pl)
 
-def fetch.f(+fault: Bool, +ph: U32, +pl: U32, +n: U32, +md: U32, +fv: U32, +fp: U32, x: Array<U32>, m: Array<U32>, s: Csr, d: Array<U32>, t: Array<U32>, +r: U32) -> Hart:
-  match fault:
-    case True{}:
-      trap(ph, pl, 4, n, md, fv, fp, x, m, s, d, t, 12, ph, pl)
-    case False{}:
+def fetch.f(+c: U32, +ph: U32, +pl: U32, +n: U32, +md: U32, +fv: U32, +fp: U32, x: Array<U32>, m: Array<U32>, s: Csr, d: Array<U32>, t: Array<U32>, +r: U32) -> Hart:
+  match c:
+    case 0:
       fetch.ok(U32.is_lt(r, RAM()), ph, pl, n, md, fv, fp, x, m, s, d, t, r)
+    case 2:
+      miss(ph, pl, n, md, fv, fp, x, m, s, d, t, r)
+    case _:
+      trap(ph, pl, 4, n, md, fv, fp, x, m, s, d, t, 12, ph, pl)
 
 def fetch.w(+ph: U32, +pl: U32, +n: U32, +md: U32, +fv: U32, +fp: U32, x: Array<U32>, w: Wk, d: Array<U32>) -> Hart:
   Wk{m, s, t, +r} = w
-  fetch.f(nz(U32.and(r, 1)), ph, pl, n, md, fv, fp, x, m, s, d, t, r)
+  fetch.f(U32.and(r, 3), ph, pl, n, md, fv, fp, x, m, s, d, t, r)
 
 def step.f(+hit: Bool, +ph: U32, +pl: U32, +n: U32, +md: U32, +fv: U32, +fp: U32, x: Array<U32>, m: Array<U32>, s: Csr, d: Array<U32>, t: Array<U32>) -> Hart:
   match hit:
@@ -2192,12 +2299,16 @@ def epoch(k: Nat, h: Hart) -> Hart:
 # Host interface
 # --------------
 
-# A hart at reset: S-mode, MMU off, FP off, a0 = hart id, a1 = the device tree.
-def Hart.new(m: Array<U32>, +hid: U32, +dtb: U32, +pc: U32) -> Hart:
+# A hart at reset: S-mode, MMU off, FP off, a0 = hart id, a1 = the device
+# tree. d has 2^dd words (dd >= 13); the console buffer takes what is free
+# above word 4096, up to 64 KiB.
+def Hart.new(m: Array<U32>, +dd: Nat, +hid: U32, +dtb: U32, +pc: U32) -> Hart:
   x = [0 : U32*256n]
   x[20] <- hid
   x[22] <- dtb
-  d = [0 : U32*131072n]
+  d = Array.new(U32, dd, 0)
+  d[D.TXB()] <- 4096
+  d[D.TXC()] <- U32.min(U32.sub(U32.shln(1, dd), 4096), 65536)
   d[D.CL()] <- 4294967295
   d[D.CH()] <- 4294967295
   d[D.HART()] <- hid
@@ -2228,15 +2339,15 @@ def drain.fin(ph: U32, pl: U32, n: U32, md: U32, fv: U32, fp: U32, x: Array<U32>
   d[U.TXN()] <- 0
   (Hart{False{}, ph, pl, n, md, fv, fp, x, m, s, d, t}, bs)
 
-def drain.a(ph: U32, pl: U32, n: U32, md: U32, fv: U32, fp: U32, x: Array<U32>, m: Array<U32>, s: Csr, dk: Array<U32> & U32, t: Array<U32>) -> Hart & List<&2, U32>:
-  (d, +k) = dk
-  +e = U32.add(U.TX(), U32.sub(k, 1))
+def drain.a(ph: U32, pl: U32, n: U32, md: U32, fv: U32, fp: U32, x: Array<U32>, m: Array<U32>, s: Csr, r: R2, t: Array<U32>) -> Hart & List<&2, U32>:
+  R2{d, +k, +base} = r
+  +e = U32.add(base, U32.sub(k, 1))
   drain.fin(ph, pl, n, md, fv, fp, x, m, s, drain.go(U32.to_nat(k), Array.get(U32, d, e), e, Nil{}), t)
 
 # Takes the bytes the guest wrote to the console since the last drain.
 def Hart.drain(h: Hart) -> Hart & List<&2, U32>:
   Hart{go, ph, pl, n, md, fv, fp, x, m, s, d, t} = h
-  drain.a(ph, pl, n, md, fv, fp, x, m, s, Array.get(U32, d, U.TXN()), t)
+  drain.a(ph, pl, n, md, fv, fp, x, m, s, get2(d, U.TXN(), D.TXB()), t)
 
 def rx.push.k(room: Bool, d: Array<U32>, +b: U32, +tl: U32) -> Array<U32>:
   match room:
@@ -2350,7 +2461,7 @@ def rot.fin(+more: Bool, +allidle: Bool, +nh: U32, h: Hart, rest: List<Ctx>) -> 
 
 # A hart leaving HSM START_PENDING: pc = start address, a0 = its id,
 # a1 = the opaque value, S-mode with the MMU and FP off.
-def rot.init(+more: Bool, +allidle: Bool, +nh: U32, +j: U32, +n: U32, x: Array<U32>, m: Array<U32>, r: R4, t: Array<U32>, rest: List<Ctx>) -> Mach:
+def rot.init(+more: Bool, +allidle: Bool, +nh: U32, +j: U32, +n: U32, +md: U32, x: Array<U32>, m: Array<U32>, r: R4, t: Array<U32>, rest: List<Ctx>) -> Mach:
   R4{d, +sh, +sl, +ah, +al} = r
   x[20] <- j
   x[21] <- 0
@@ -2361,12 +2472,12 @@ def rot.init(+more: Bool, +allidle: Bool, +nh: U32, +j: U32, +n: U32, x: Array<U
   d[D.CL()] <- 4294967295
   d[D.CH()] <- 4294967295
   d[D.STIP()] <- 0
-  rot.fin(more, allidle, nh, Hart{True{}, sh, sl, n, 1, 1, 1, x, m, Csr{1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, d, tlb.flush(t)}, rest)
+  rot.fin(more, allidle, nh, Hart{True{}, sh, sl, n, U32.or(1, U32.and(md, 64)), 1, 1, x, m, Csr{1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, d, tlb.flush(t)}, rest)
 
 def rot.start(+st: Bool, +more: Bool, +allidle: Bool, +nh: U32, +j: U32, +ph: U32, +pl: U32, +n: U32, +md: U32, +fv: U32, +fp: U32, x: Array<U32>, m: Array<U32>, s: Csr, d: Array<U32>, t: Array<U32>, rest: List<Ctx>) -> Mach:
   match st:
     case True{}:
-      rot.init(more, allidle, nh, j, n, x, m, get4(d, hw(j, HW.SPH()), hw(j, HW.SPL()), hw(j, HW.AH()), hw(j, HW.AL())), t, rest)
+      rot.init(more, allidle, nh, j, n, md, x, m, get4(d, hw(j, HW.SPH()), hw(j, HW.SPL()), hw(j, HW.AH()), hw(j, HW.AL())), t, rest)
     case False{}:
       rot.fin(more, allidle, nh, Hart{True{}, ph, pl, n, md, fv, fp, x, m, s, d, t}, rest)
 
@@ -2486,10 +2597,11 @@ def mach.init(+nh: U32, h: Hart) -> Hart:
   d[D.QUANT()] <- sel(U32.is_ge(nh, 2), 8192, 4294967295)
   Hart{go, ph, pl, n, md, fv, fp, x, m, s, mach.init.go(16n, d, 0), t}
 
-# A guest with nh harts (1..16): hart 0 starts at pc in S-mode with a0 = 0
-# and a1 = dtb; the others stay stopped until an SBI HSM hart_start.
-def Mach.new(m: Array<U32>, +nh: U32, +dtb: U32, +pc: U32) -> Mach:
-  Mach{mach.init(nh, Hart.new(m, 0, dtb, pc)), ctx.list(U32.to_nat(U32.sub(nh, 1)))}
+# A guest with nh harts (1..16) and 2^dd device words: hart 0 starts at pc
+# in S-mode with a0 = 0 and a1 = dtb; the others stay stopped until an SBI
+# HSM hart_start.
+def Mach.new(m: Array<U32>, +dd: Nat, +nh: U32, +dtb: U32, +pc: U32) -> Mach:
+  Mach{mach.init(nh, Hart.new(m, dd, 0, dtb, pc)), ctx.list(U32.to_nat(U32.sub(nh, 1)))}
 
 def mach.arm.a(+budget: U32, ph: U32, pl: U32, n: U32, md: U32, fv: U32, fp: U32, x: Array<U32>, m: Array<U32>, s: Csr, de: Array<U32> & U32, t: Array<U32>) -> Hart:
   (d, ex) = de
@@ -2549,6 +2661,46 @@ def Fleet.epoch(+k: Nat, +budget: U32, f: Fleet) -> Fleet:
       x y = Fleet.epoch(k, budget, a) Fleet.epoch(k, budget, b)
       Two{x, y}
 
+# Runs inside one bang: epoch after epoch until every machine has stopped
+# (or n epochs), so the host is not in the loop at all. Each epoch is still
+# a fork over the machines and a join, which is the barrier where later
+# cross-machine traffic belongs; consoles keep collecting in each machine's
+# TX buffer until the host drains them with Fleet.tally.
+type Run is Type:
+  Run{f: Fleet, live: U32}
+
+def run.vm(r: Mach & U32) -> Run:
+  (mc, +ex) = r
+  Run{VM{mc}, bit(U32.is_zero(ex))}
+
+def run.two(ra: Run, rb: Run) -> Run:
+  Run{a, la} = ra
+  Run{b, lb} = rb
+  Run{Two{a, b}, U32.add(la, lb)}
+
+# One epoch over the fleet, counting the machines still running.
+def Fleet.step(+k: Nat, +budget: U32, f: Fleet) -> Run:
+  match f:
+    case VM{mc}:
+      run.vm(Mach.exit(Mach.epoch(k, Mach.arm(budget, mc))))
+    case Two{a, b}:
+      x y = Fleet.step(k, budget, a) Fleet.step(k, budget, b)
+      run.two(x, y)
+
+def Fleet.loop(n: Nat, +budget: U32, r: Run) -> Fleet:
+  match n r:
+    case 0n Run{f, live}:
+      f
+    case 1n+p Run{f, 0}:
+      f
+    case 1n+p Run{f, _}:
+      Fleet.loop(p, budget, Fleet.step(1000000n, budget, f))
+
+# Up to n epochs of `budget` instructions per machine, as one call: with
+# `Fleet.run!` the whole run is one GPU bang.
+def Fleet.run(n: Nat, +budget: U32, f: Fleet) -> Fleet:
+  Fleet.loop(n, budget, Run{f, 1})
+
 type Tally is Type:
   Tally{f: Fleet, live: U32, lo: U32, out: List<&2, U32>}
 
@@ -2578,6 +2730,216 @@ def Fleet.tally(f: Fleet) -> Tally:
       tally.drained(Mach.drain(mc))
     case Two{a, b}:
       tally.two(Fleet.tally(a), Fleet.tally(b))
+
+
+# Copy-on-write snapshot fleets
+# -----------------------------
+# Boot one machine, then fork it into many that share its RAM: the snapshot
+# keeps the RAM, each fork owns only the pages it touches (see `pdx`). The
+# snapshot's RAM is one array, so no lane may read it during an epoch; misses
+# are served between epochs instead, in one pass over the fleet that copies
+# each missed page (and the next few, which are usually wanted next) into
+# the fork's pool. All of it, epochs and serving, runs inside one call.
+
+type MF is Type:
+  MF{a: Mach, b: Mach}
+
+def fork.c(+ph: U32, +pl: U32, +n: U32, +md: U32, +fv: U32, +fp: U32, m: Array<U32>, +s: Csr, rd: Array<U32> & Array<U32>, t: Array<U32>, rx: Array<U32> & Array<U32>, +pd: Nat, q: List<Ctx>) -> MF:
+  (d, d2) = rd
+  (x, x2) = rx
+  d2[D.EXIT()] <- 0
+  d2[D.MISS()] <- 0
+  d2[D.RESV()] <- 0
+  d2[U.TXN()] <- 0
+  d2[D.PNEXT()] <- 32
+  d2[D.PCAP()] <- U32.shln(1, U32.to_nat(U32.sub(U32.from_nat(pd), 10)))
+  MF{Mach{Hart{False{}, ph, pl, n, md, fv, fp, x, m, s, d, t}, q}, Mach{Hart{True{}, ph, pl, n, U32.or(md, 64), 1, fp, x2, Array.new(U32, pd, 0), s, d2, [0 : U32*512n]}, Nil{}}}
+
+# A fork of a one-hart machine: its registers, CSRs and devices, an empty
+# TLB, and RAM of its own: 2^pd words (pd >= 16), the page directory in the
+# first 32 pages (all absent) and the pool after it. Returns the snapshot
+# beside the fork.
+def Mach.fork(mc: Mach, +pd: Nat) -> MF:
+  Mach{h, q} = mc
+  Hart{go, ph, pl, n, md, fv, fp, x, m, s, d, t} = h
+  fork.c(ph, pl, n, md, fv, fp, m, s, Array.clone(U32, d), t, Array.clone(U32, x), pd, q)
+
+# The RAM of a machine: what a snapshot's forks share.
+def Mach.ram(mc: Mach) -> Array<U32>:
+  Mach{h, q} = mc
+  Hart{go, ph, pl, n, md, fv, fp, x, m, s, d, t} = h
+  m
+
+def pool.a(ph: U32, pl: U32, n: U32, md: U32, fv: U32, fp: U32, x: Array<U32>, m: Array<U32>, s: Csr, dp: Array<U32> & U32, t: Array<U32>, q: List<Ctx>) -> Mach & U32:
+  (d, +pn) = dp
+  (Mach{Hart{False{}, ph, pl, n, md, fv, fp, x, m, s, d, t}, q}, U32.sub(pn, 32))
+
+# Pool pages a fork has filled so far.
+def Mach.pool(mc: Mach) -> Mach & U32:
+  Mach{h, q} = mc
+  Hart{go, ph, pl, n, md, fv, fp, x, m, s, d, t} = h
+  pool.a(ph, pl, n, md, fv, fp, x, m, s, Array.get(U32, d, D.PNEXT()), t, q)
+
+type CP is Type:
+  CP{m: Array<U32>, b: Array<U32>}
+
+type CPN is Type:
+  CPN{m: Array<U32>, b: Array<U32>, pn: U32}
+
+def cp.go(k: Nat, m: Array<U32>, bw: Array<U32> & U32, +i: U32, +src: U32, +dst: U32) -> CP:
+  match k:
+    case 0n:
+      (b, w) = bw
+      CP{m, b}
+    case 1n+p:
+      (b, w) = bw
+      m[U32.add(dst, i)] <- w
+      cp.go(p, m, Array.get(U32, b, U32.add(src, U32.add(i, 1))), U32.add(i, 1), src, dst)
+
+def cpn.of(+pn: U32, r: CP) -> CPN:
+  CP{m, b} = r
+  CPN{m, b, pn}
+
+# Copies snapshot page g into pool page pn and maps it.
+def pf.copy(+ok: Bool, m: Array<U32>, b: Array<U32>, +g: U32, +pn: U32) -> CPN:
+  match ok:
+    case True{}:
+      m[g] <- pn
+      cpn.of(U32.add(pn, 1), cp.go(1024n, m, Array.get(U32, b, U32.shln(g, 10n)), 0, U32.shln(g, 10n), U32.shln(pn, 10n)))
+    case False{}:
+      CPN{m, b, pn}
+
+def pf.one(me: Array<U32> & U32, b: Array<U32>, +g: U32, +pn: U32, +pc: U32) -> CPN:
+  (m, +e) = me
+  pf.copy(Bool.and(Bool.and(U32.is_zero(e), U32.is_lt(g, 32768)), U32.is_lt(pn, pc)), m, b, g, pn)
+
+# Pages g, g+1, ..., g+k-1 that the fork lacks, while its pool has room.
+def pf.go(k: Nat, r: CPN, +g: U32, +pc: U32) -> CPN:
+  match k:
+    case 0n:
+      r
+    case 1n+p:
+      CPN{m, b, +pn} = r
+      pf.go(p, pf.one(Array.get(U32, m, g), b, g, pn, pc), U32.add(g, 1), pc)
+
+type SV is Type:
+  SV{b: Array<U32>, mc: Mach, l: U32}
+
+def serve.fin(+ph: U32, +pl: U32, +n: U32, +md: U32, +fv: U32, +fp: U32, x: Array<U32>, s: Csr, d: Array<U32>, t: Array<U32>, q: List<Ctx>, r: CPN) -> SV:
+  CPN{m, b, +pn} = r
+  d[D.PNEXT()] <- pn
+  SV{b, Mach{Hart{True{}, ph, pl, n, md, fv, fp, x, m, s, d, t}, q}, 1}
+
+# c: 2 a miss the pool has room for, 3 a miss it has not (EXIT 5), 1 running,
+# 0 stopped.
+def serve.k(+c: U32, +ph: U32, +pl: U32, +n: U32, +md: U32, +fv: U32, +fp: U32, x: Array<U32>, m: Array<U32>, s: Csr, d: Array<U32>, t: Array<U32>, q: List<Ctx>, b: Array<U32>, +ms: U32, +pn: U32, +pc: U32) -> SV:
+  match c:
+    case 2:
+      d[D.EXIT()] <- 0
+      d[D.MISS()] <- 0
+      serve.fin(ph, pl, n, md, fv, fp, x, s, d, t, q, pf.go(8n, CPN{m, b, pn}, U32.shrn(ms, 12n), pc))
+    case 3:
+      d[D.EXIT()] <- 5
+      SV{b, Mach{Hart{False{}, ph, pl, n, md, fv, fp, x, m, s, d, t}, q}, 0}
+    case 1:
+      SV{b, Mach{Hart{True{}, ph, pl, n, md, fv, fp, x, m, s, d, t}, q}, 1}
+    case _:
+      SV{b, Mach{Hart{False{}, ph, pl, n, md, fv, fp, x, m, s, d, t}, q}, 0}
+
+def serve.a(+ph: U32, +pl: U32, +n: U32, +md: U32, +fv: U32, +fp: U32, x: Array<U32>, m: Array<U32>, s: Csr, r: R4, t: Array<U32>, q: List<Ctx>, b: Array<U32>) -> SV:
+  R4{d, +ex, +ms, +pn, +pc} = r
+  serve.k(sel(U32.is_eq(ex, 4), sel(U32.is_lt(pn, pc), 2, 3), sel(U32.is_zero(ex), 1, 0)), ph, pl, n, md, fv, fp, x, m, s, d, t, q, b, ms, pn, pc)
+
+def serve.one(mc: Mach, b: Array<U32>) -> SV:
+  Mach{h, q} = mc
+  Hart{go, ph, pl, n, md, fv, fp, x, m, s, d, t} = h
+  serve.a(ph, pl, n, md, fv, fp, x, m, s, get4(d, D.EXIT(), D.MISS(), D.PNEXT(), D.PCAP()), t, q, b)
+
+def flat(f: Fleet, acc: List<Mach>) -> List<Mach>:
+  match f:
+    case VM{mc}:
+      mc <> acc
+    case Two{a, b}:
+      flat(a, flat(b, acc))
+
+# The machines of a fleet, in tree order.
+def Fleet.list(f: Fleet) -> List<Mach>:
+  flat(f, Nil{})
+
+def vms(ms: List<Mach>) -> List<Fleet>:
+  match ms:
+    case Nil{}:
+      Nil{}
+    case Con{mc, rest}:
+      VM{mc} <> vms(rest)
+
+def pairs(fs: List<Fleet>) -> List<Fleet>:
+  match fs:
+    case Con{a, Con{b, rest}}:
+      Two{a, b} <> pairs(rest)
+    case Con{a, Nil{}}:
+      a <> Nil{}
+    case Nil{}:
+      Nil{}
+
+def tree.go(k: Nat, fs: List<Fleet>) -> Fleet:
+  match k fs:
+    case _ Con{a, Nil{}}:
+      a
+    case 1n+p Con{a, Con{b, rest}}:
+      tree.go(p, pairs(Con{a, Con{b, rest}}))
+    case _ _:
+      VM{Mach{Hart{False{}, 0, 0, 0, 1, 1, 1, [0 : U32*1n], [0 : U32*1n], Csr{1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, [0 : U32*1n], [0 : U32*1n]}, Nil{}}}
+
+# A balanced fleet of these machines, in this order.
+def Fleet.of(ms: List<Mach>) -> Fleet:
+  tree.go(32n, vms(ms))
+
+type Snap is Type:
+  Snap{b: Array<U32>, f: Fleet, live: U32}
+
+def serve.go(ms: List<Mach>, sv: SV, acc: List<Mach>, +live: U32) -> Snap:
+  match ms:
+    case Nil{}:
+      SV{b, mc, l} = sv
+      Snap{b, Fleet.of(List.reverse(&1, Mach, mc <> acc)), U32.add(live, l)}
+    case Con{m1, rest}:
+      SV{b, mc, l} = sv
+      serve.go(rest, serve.one(m1, b), mc <> acc, U32.add(live, l))
+
+def snap.serve.l(b: Array<U32>, ms: List<Mach>) -> Snap:
+  match ms:
+    case Nil{}:
+      Snap{b, VM{Mach{Hart{False{}, 0, 0, 0, 1, 1, 1, [0 : U32*1n], [0 : U32*1n], Csr{1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, [0 : U32*1n], [0 : U32*1n]}, Nil{}}}, 0}
+    case Con{m1, rest}:
+      serve.go(rest, serve.one(m1, b), Nil{}, 0)
+
+# Serves the misses of the last epoch; live counts the forks still running.
+def snap.serve(b: Array<U32>, r: Run) -> Snap:
+  Run{f, live} = r
+  snap.serve.l(b, Fleet.list(f))
+
+def Snap.loop(n: Nat, +budget: U32, sp: Snap) -> Snap:
+  match n sp:
+    case 0n _:
+      sp
+    case 1n+p Snap{b, f, 0}:
+      Snap{b, f, 0}
+    case 1n+p Snap{b, f, _}:
+      Snap.loop(p, budget, snap.serve(b, Fleet.step(1000000n, budget, f)))
+
+# A snapshot's RAM and its forks (see Mach.fork).
+def Snap.of(b: Array<U32>, ms: List<Mach>) -> Snap:
+  Snap{b, Fleet.of(ms), 1}
+
+# Up to n epochs (and the serving between them) until every fork has
+# stopped: with `Snap.run!`, one GPU bang.
+def Snap.run(n: Nat, +budget: U32, sp: Snap) -> Snap:
+  Snap.loop(n, budget, sp)
+
+def Snap.fleet(sp: Snap) -> Fleet:
+  Snap{b, f, live} = sp
+  f
 
 # Tracing (WILTEE_TRACE=1): one line per epoch on stderr.
 

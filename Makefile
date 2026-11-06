@@ -6,9 +6,13 @@ OBJCOPY_RV ?= $(shell command -v llvm-objcopy-19 || command -v llvm-objcopy)
 RVFLAGS = --target=riscv32 -march=rv32ima -mabi=ilp32 -nostdlib
 LINUX = build/linux/Image platform/wiltee.dtb build/linux/rootfs.cpio
 
-.PHONY: all check check64 test test-bare test-isa test-isa64 test-linux linux run clean
+.PHONY: all check check64 test test-bare test-bare64 test-rvc test-isa test-isa64 test-linux linux run clean
 
-all: build/wiltee build/fleet platform/wiltee.dtb build/wiltee64 platform/wiltee64.dtb
+# RVC: C.expand against LLVM and the spec for all 49,152 halfwords
+test-rvc:
+	tests/rvc/check.sh
+
+all: build/wiltee build/fleet platform/wiltee.dtb build/wiltee64 build/fleet64 build/cow64 platform/wiltee64.dtb platform/wiltee64-sh.dtb
 
 # bend exits non-zero when a file depends on @unsafe/foreign code (the host
 # loops do), so success is judged by the binary it leaves behind.
@@ -34,6 +38,23 @@ platform/%.dtb: platform/%.dts
 platform/wiltee64-smp%.dts: scripts/mkdts64.py
 	python3 scripts/mkdts64.py --harts $* > $@
 
+build/cow64: src/hart64.bend src/rvc.bend src/cow64.bend
+	@mkdir -p build
+	-@$(BEND) src/cow64.bend -o $@ > build/cow64.log 2>&1
+	@test -x $@ || (cat build/cow64.log; exit 1)
+
+build/fleet64: src/hart64.bend src/rvc.bend src/fleet64.bend
+	@mkdir -p build
+	-@$(BEND) src/fleet64.bend -o $@ > build/fleet64.log 2>&1
+	@test -x $@ || (cat build/fleet64.log; exit 1)
+
+# RV64 bare-metal images (with C)
+build/%64.bin: tests/bare/%64.S
+	@mkdir -p build
+	$(CC_RV) --target=riscv64 -march=rv64imac -mabi=lp64 -nostdlib -c $< -o build/$*64.o
+	$(LD_RV) -Ttext=0 -o build/$*64.elf build/$*64.o
+	$(OBJCOPY_RV) -O binary build/$*64.elf $@
+
 build/%.bin: tests/bare/%.S
 	@mkdir -p build
 	$(CC_RV) $(RVFLAGS) -c $< -o build/$*.o
@@ -53,6 +74,13 @@ test-bare: build/wiltee build/fleet build/hello.bin build/fleet.bin
 	./build/wiltee build/hello.bin - - | grep -q '^PASS'
 	./build/fleet build/fleet.bin 2 | grep -q 'vm 00000003 f1667903'
 	@echo "bare tests: PASS"
+
+# 4 RV64 machines, one bang for the whole run; results checked against the
+# LCG computed by tests/bare/fleet64.py.
+test-bare64: build/fleet64 build/fleet64.bin
+	./build/fleet64 build/fleet64.bin 2 run | grep '^vm' | cut -c1-36 > build/fleet64.out
+	python3 tests/bare/fleet64.py 4 | diff - build/fleet64.out
+	@echo "bare64 tests: PASS"
 
 test-isa: build/wiltee
 	scripts/isa-tests.sh
