@@ -6,9 +6,9 @@ OBJCOPY_RV ?= $(shell command -v llvm-objcopy-19 || command -v llvm-objcopy)
 RVFLAGS = --target=riscv32 -march=rv32ima -mabi=ilp32 -nostdlib
 LINUX = build/linux/Image platform/wiltee.dtb build/linux/rootfs.cpio
 
-.PHONY: all check test test-bare test-isa test-linux linux run clean
+.PHONY: all check check64 test test-bare test-isa test-isa64 test-linux linux run clean
 
-all: build/wiltee build/fleet platform/wiltee.dtb
+all: build/wiltee build/fleet platform/wiltee.dtb build/wiltee64 platform/wiltee64.dtb
 
 # bend exits non-zero when a file depends on @unsafe/foreign code (the host
 # loops do), so success is judged by the binary it leaves behind.
@@ -17,13 +17,22 @@ build/wiltee: src/hart.bend src/wiltee.bend src/tty.c src/tty.js
 	-@$(BEND) src/wiltee.bend -o $@ > build/wiltee.log 2>&1
 	@test -x $@ || (cat build/wiltee.log; exit 1)
 
+build/wiltee64: src/hart64.bend src/rvc.bend src/wiltee64.bend src/tty.c src/tty.js
+	@mkdir -p build
+	-@$(BEND) src/wiltee64.bend -o $@ > build/wiltee64.log 2>&1
+	@test -x $@ || (cat build/wiltee64.log; exit 1)
+
 build/fleet: src/hart.bend src/fleet.bend
 	@mkdir -p build
 	-@$(BEND) src/fleet.bend -o $@ > build/fleet.log 2>&1
 	@test -x $@ || (cat build/fleet.log; exit 1)
 
-platform/wiltee.dtb: platform/wiltee.dts
+platform/%.dtb: platform/%.dts
 	dtc -q -I dts -O dtb -o $@ $<
+
+# RV64 device trees for N harts: platform/wiltee64-smpN.dts
+platform/wiltee64-smp%.dts: scripts/mkdts64.py
+	python3 scripts/mkdts64.py --harts $* > $@
 
 build/%.bin: tests/bare/%.S
 	@mkdir -p build
@@ -36,6 +45,10 @@ build/%.bin: tests/bare/%.S
 check:
 	$(BEND) src/hart.bend
 
+# The same for the RV64 machine.
+check64:
+	$(BEND) src/hart64.bend
+
 test-bare: build/wiltee build/fleet build/hello.bin build/fleet.bin
 	./build/wiltee build/hello.bin - - | grep -q '^PASS'
 	./build/fleet build/fleet.bin 2 | grep -q 'vm 00000003 f1667903'
@@ -43,6 +56,9 @@ test-bare: build/wiltee build/fleet build/hello.bin build/fleet.bin
 
 test-isa: build/wiltee
 	scripts/isa-tests.sh
+
+test-isa64: build/wiltee64
+	XLEN=64 scripts/isa-tests.sh
 
 linux: build/linux/Image
 
